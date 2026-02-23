@@ -197,7 +197,7 @@ def animate_fixed_points(rnn, train_R_list, pca=None, save_path=None, fps=20, dp
         else:
             fps_arr = np.empty((0, rnn.hidden_size))
         fps_per_epoch.append(fps_arr)
-        if (i + 1) % 100 == 0:
+        if (i + 1) % 10 == 0:
             print(f"  Epoch {(i+1) * stride}/{n_epochs * stride}: {fps_arr.shape[0]} fixed points")
 
     # Fit PCA on all fixed points combined

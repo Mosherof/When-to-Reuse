@@ -48,8 +48,6 @@ def find_fixed_points_KE_min(model, sample_states, lr=0.1, max_iter=1000, tol=1e
         if not is_duplicate:
             unique_fps.append(fp)
             
-    print(n_inits, "initializations, found", len(unique_fps), "unique fixed points")
-            
     unique_fps = torch.cat(unique_fps, dim=0).cpu().numpy() if len(unique_fps) > 0 else np.array([])
             
     return unique_fps

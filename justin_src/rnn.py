@@ -253,11 +253,16 @@ def inference_rnn(rnn, task):
     with torch.no_grad():
         R_list = []
         losses = []
+        weight_snapshots = []
         for epoch in range(1000):
             R, O_pred_test = rnn(U_test)
             R_list.append(R.detach().cpu())
             loss = loss_function(O_pred_test, O_test)
             losses.append(loss.item())
+            weight_snapshots.append({
+                'W_rec': rnn.W_rec.detach().cpu().clone(),
+                'b_rec': rnn.b_rec.detach().cpu().clone(),
+            })
 
             if (epoch + 1) % 100 == 0:
                 print(f"Epoch {epoch+1}/1000, Loss: {loss.item():.6f}")
@@ -265,7 +270,7 @@ def inference_rnn(rnn, task):
     print("-" * 60)
     print(f"Inference complete! Mean loss: {sum(losses)/len(losses):.6f}")
 
-    return R_list, losses
+    return R_list, losses, weight_snapshots
 
 # Main execution
 #if __name__ == "__main__":
