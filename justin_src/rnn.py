@@ -14,6 +14,19 @@ import matplotlib.pyplot as plt
 from viz import viz_R, animate_R
 
 class FlipFlopTask:
+    """
+    A flip flop task.
+
+    Attributes:
+    -----------
+        batch_size (int): the batch size.
+        T (int): the time duration.
+        dt (float): the small change in time.
+        flip_prob (float): the liklihood of a flip occuring.
+        bits (int): the number of bits.
+        U (tensor): the input tensor of size batch_size X T X bits.
+        O (tensor): the output tensor of size batch_size X T X bits.
+    """
     def __init__(self, batch_size, T=100, dt=1.0, flip_prob=0.05, bits=2):
         self.batch_size = batch_size
         self.T = T
@@ -24,6 +37,14 @@ class FlipFlopTask:
         self.O = None
         
     def generate(self):
+        """
+        Generates input and output tensors for the flip flop task object
+
+        Returns:
+        -----------
+            U (tensor): the input tensor of size batch_size X T X bits.
+            O(tensor): the output tensor of size batch_size X T X bits.
+        """
         self.U = torch.zeros(self.batch_size, self.T, self.bits)
         self.O = torch.zeros(self.batch_size, self.T, self.bits)
         
@@ -46,12 +67,40 @@ class FlipFlopTask:
         return self.U, self.O
     
     def get(self):
+        """
+        Gets input and output tensors. If they have not been generated yet, creates tensors.
+
+        Returns:
+        -----------
+            U (tensor): the input tensor of size batch_size X T X bits.
+            O (tensor): the output tensor of size batch_size X T X bits.
+        """
         if self.U is None or self.O is None:
             return self.generate()
         return self.U, self.O
 
 class RNN(nn.Module):
+    """
+    Creates an RNN.
+
+    Attributes:
+    -----------
+        input_size (int): The size of the input tensor.
+        hidden_size (int): 
+        output_size (int): The size of the output tensor.
+        tau (int): The time steps.
+        dt (int): The time small change in time.
+        alpha (float): 
+        use_bias (boolean): Determines if the bias tensor is zero.
+        W_rec (tensor): The recurrent weight matrix.
+        W_in (tensor): The input weight matrix.
+        W_out (tensor): The output weight matrix.
+        b_rec (tensor): The reccurent bias matrix.
+        b_out (tensor): The output bias matrix.
+    """
+    
     def __init__(self, input_size=2, hidden_size=100, output_size=2, tau=2.0, dt=1.0, use_bias=False):
+
         super(RNN, self).__init__()
         
         self.input_size = input_size
@@ -81,8 +130,7 @@ class RNN(nn.Module):
         
         Parameters:
         -----------
-        weights : list of str or None
-            List of weight names to reinitialize. Options: 'W_rec', 'W_in', 'W_out', 'b_rec', 'b_out'.
+        weights (list or str):  List of weight names to reinitialize. Options: 'W_rec', 'W_in', 'W_out', 'b_rec', 'b_out'.
             If None, reinitializes all weights.
         """
         print(f"Reinitializing weights: {weights if weights is not None else 'all'}")
@@ -112,12 +160,14 @@ class RNN(nn.Module):
     def get_hidden_states(self, U):
         """
         Runs a forward pass and returns only the hidden states.
-        
-        Args:
-            U: Input tensor of shape (batch_size, T, input_size)
-            
+
+        Parameters:
+        -----------
+            U (tensor): Input tensor of shape (batch_size, T, input_size).
+ 
         Returns:
-            R: Hidden states tensor of shape (batch_size, T + 1, hidden_size)
+        -----------
+            R (tensor): Hidden states tensor of shape (batch_size, T + 1, hidden_size)
         """
         # Run the forward pass
         with torch.no_grad():
@@ -128,6 +178,18 @@ class RNN(nn.Module):
         return R
         
     def forward(self, U):
+        """
+        Computes the next iteration of hidden states and and output tensor estimates using the input tensor.
+    
+        Parameters:
+        -----------
+            U (tensor): Input tensor of shape (batch_size, T, input_size).
+      
+        Returns:
+        -----------
+            R (tensor): Hidden states tensor of shape (batch_size, T + 1, hidden_size).
+            O (tensor): The estimated output tensor.
+        """
         batch_size, T, _ = U.shape
         
         r = torch.randn(batch_size, self.hidden_size) * np.sqrt(0.1)
@@ -165,6 +227,10 @@ def loss_function(O_pred, O_target):
         Predicted outputs of shape (B, T, bits)
     O_target : torch.Tensor
         Target outputs of shape (B, T, bits)
+
+    Returns:
+    -----------
+    mse (float): the mean square error loss between the predicted and target output.
     """
     B = O_pred.shape[0]
     T = O_pred.shape[1]
@@ -189,6 +255,12 @@ def train_rnn(rnn, task, n_epochs=2000, learning_rate=1e-3, batch_size=128):
         Learning rate for ADAM optimizer
     batch_size : int
         Batch size for training
+    
+    Returns:
+    -----------
+    R_list (list): the hidden states of all epochs.
+    losses (list): the mean square errors of all epochs.
+    weight_snapshots(list): the w_rec and b_rec of all epochs.
     """
     optimizer = optim.Adam(rnn.parameters(), lr=learning_rate)
     
@@ -244,6 +316,12 @@ def inference_rnn(rnn, task):
         The trained RNN model
     task : FlipFlopTask
         Task generator
+
+    Returns:
+    -----------
+    R_list (list): the hidden states of all epochs.
+    losses (list): the mean square errors of all epochs.
+    weight_snapshots(list): the w_rec and b_rec of all epochs.
     """
     U_test, O_test = task.get()
 
