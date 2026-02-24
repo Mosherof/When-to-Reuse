@@ -2,6 +2,7 @@ import torch
 import numpy as np
 
 def process_R_list(R_list):
+    # removes the batch dimension
     print("Shape of R_list:", np.array(R_list).shape)
 
     R_list = torch.cat(R_list, dim=0)
