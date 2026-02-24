@@ -4,14 +4,14 @@ from pathlib import Path
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
-from fixed_points import find_fixed_points_KE_min
+from fixed_points import find_fixed_points_KE_min, classify_fixed_points_stability
 
 def fit_pca(R_list):
     pca = PCA(n_components=2)
     pca.fit(R_list)
     return pca
 
-def animate_R(R_list, interval=50, fixed_points=None, save_path=None, fps=20, stride=1, dpi=160, show=False, pca=None, lim=None, title=None):
+def animate_R(R_list, interval=50, fixed_points=None, fixed_point_labels=None, save_path=None, fps=20, stride=1, dpi=160, show=False, pca=None, lim=None, title=None):
     """
     Animate the neural activity R trajectory over epochs and time for a given batch index.
     Uses PCA to reduce dimensionality to 2D and animates the trajectory.
@@ -74,7 +74,20 @@ def animate_R(R_list, interval=50, fixed_points=None, save_path=None, fps=20, st
     ax.set_ylim(lim[2], lim[3])
     
     if fp_2d is not None:
-        ax.scatter(fp_2d[:, 0], fp_2d[:, 1], c='red', marker='X', s=100, label='Fixed Points')
+        if fixed_point_labels is None:
+            ax.scatter(fp_2d[:, 0], fp_2d[:, 1], c='red', marker='X', s=100, label='Fixed Points')
+        else:
+            labels = np.asarray(fixed_point_labels, dtype=object)
+            if labels.shape[0] != fp_2d.shape[0]:
+                raise ValueError("fixed_point_labels length must match number of fixed points")
+            stable_mask = labels == "stable"
+            unstable_mask = ~stable_mask
+            if np.any(stable_mask):
+                ax.scatter(fp_2d[stable_mask, 0], fp_2d[stable_mask, 1],
+                           c='green', marker='o', s=80, label='Stable FP')
+            if np.any(unstable_mask):
+                ax.scatter(fp_2d[unstable_mask, 0], fp_2d[unstable_mask, 1],
+                           c='red', marker='X', s=100, label='Unstable FP')
     
     # Initialize scatter plot for all points
     scatter = ax.scatter([], [], c=[], cmap='viridis', s=10, alpha=0.6)
@@ -611,26 +624,34 @@ def plot_fixed_points_stability(states, fixed_points, stability, pca=None, title
 
     ax.scatter(states_2d[:, 0], states_2d[:, 1], c='lightgray', s=8, alpha=0.25, label='State samples')
 
-    style = {
-        "stable": {"color": "#2A9D8F", "marker": "o", "label": "Stable"},
-        "marginal": {"color": "#E9C46A", "marker": "^", "label": "Marginal"},
-        "unstable": {"color": "#E76F51", "marker": "X", "label": "Unstable"},
-    }
+    stable_mask = labels == "stable"
+    unstable_mask = ~stable_mask
 
-    for key in ["stable", "marginal", "unstable"]:
-        mask = labels == key
-        if np.any(mask):
-            ax.scatter(
-                fp_2d[mask, 0],
-                fp_2d[mask, 1],
-                c=style[key]["color"],
-                marker=style[key]["marker"],
-                s=140,
-                edgecolors='black',
-                linewidths=0.6,
-                label=style[key]["label"],
-                zorder=5,
-            )
+    if np.any(stable_mask):
+        ax.scatter(
+            fp_2d[stable_mask, 0],
+            fp_2d[stable_mask, 1],
+            c="green",
+            marker="o",
+            s=120,
+            edgecolors='black',
+            linewidths=0.6,
+            label="Stable",
+            zorder=5,
+        )
+
+    if np.any(unstable_mask):
+        ax.scatter(
+            fp_2d[unstable_mask, 0],
+            fp_2d[unstable_mask, 1],
+            c="red",
+            marker="X",
+            s=140,
+            edgecolors='black',
+            linewidths=0.6,
+            label="Unstable",
+            zorder=5,
+        )
 
     ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%})')
     ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%})')
@@ -644,3 +665,20 @@ def plot_fixed_points_stability(states, fixed_points, stability, pca=None, title
             plt.show()
 
     return pca
+
+
+def plot_fixed_points_stability_from_model(model, states, fixed_points, pca=None, title=None, ax=None, show=True):
+    """
+    Convenience wrapper: classify fixed points then plot with
+    stable=green dots and unstable=red X.
+    """
+    stability = classify_fixed_points_stability(model, fixed_points)
+    return plot_fixed_points_stability(
+        states=states,
+        fixed_points=fixed_points,
+        stability=stability,
+        pca=pca,
+        title=title,
+        ax=ax,
+        show=show,
+    )
