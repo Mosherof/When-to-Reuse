@@ -173,6 +173,7 @@ def animate_fixed_points(rnn, train_R_list, pca=None, save_path=None, fps=20, dp
     # Find fixed points at each epoch
     print(f"Finding fixed points for {n_epochs * stride} epochs...")
     fps_per_epoch = []
+    fps_list = None
     for i in range(n_epochs):
         # Temporarily swap in per-epoch weights if available
         if weight_snapshots is not None:
@@ -181,7 +182,13 @@ def animate_fixed_points(rnn, train_R_list, pca=None, save_path=None, fps=20, dp
             rnn.W_rec.data = weight_snapshots[i]['W_rec'].to(rnn.W_rec.device)
             rnn.b_rec.data = weight_snapshots[i]['b_rec'].to(rnn.b_rec.device)
         
-        fps_list = fp_finder(rnn, train_R_list[i], **fp_kwargs)
+        # Use the fixed points from previous epoch as initial conditions for fixed point finding
+        initial_states = train_R_list[i]
+        if fps_list is not None:
+            fps_tensor = torch.from_numpy(fps_list).to(initial_states[0].dtype)
+            initial_states = torch.cat([initial_states, fps_tensor], dim=0)
+        
+        fps_list = fp_finder(rnn, initial_states, **fp_kwargs)
         
         # Restore original weights
         if weight_snapshots is not None:
