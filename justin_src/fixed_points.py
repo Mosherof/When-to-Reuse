@@ -1,70 +1,38 @@
 import torch
+import torch.nn as nn
 import numpy as np
 
-def find_fixed_points_KE_min(model, sample_states, lr=0.1, max_iter=1000, tol=1e-9, dup_thresh=0.1):
-    """
-    Vectorized fixed-point finder via kinetic-energy minimization.
 
-    model: trained RNN model
-    sample_states: tensor of shape (num_samples, hidden_size) or (batch, T, hidden_size)
-    lr: learning rate for Adam
-    max_iter: maximum optimisation steps
-    tol: energy threshold to declare convergence
-    dup_thresh: L2 distance below which two fixed points are considered duplicates
-    """
-
-    W_rec = model.W_rec.detach()
-    b_rec = model.b_rec.detach()
-
-    # Flatten to 2D: (total_samples, hidden_size)
+def _flatten_states(sample_states, hidden_size):
     if sample_states.dim() == 3:
-        sample_states = sample_states.reshape(-1, model.hidden_size)
+        return sample_states.reshape(-1, hidden_size)
+    if sample_states.dim() == 2:
+        return sample_states
+    raise ValueError(f"sample_states must have shape (N,H) or (B,T,H), got {tuple(sample_states.shape)}")
 
-    # ---- batched optimisation ------------------------------------------------
-    r = sample_states.clone().detach().requires_grad_(True)  # (N, hidden_size)
-    optimizer = torch.optim.Adam([r], lr=lr)
 
-    for _ in range(max_iter):
-        optimizer.zero_grad()
+def _deduplicate_points(points, scores, dup_thresh):
+    """Greedy deduplication keeping the lowest-score point in each neighborhood."""
+    if points.shape[0] == 0:
+        return points, scores
 
-        r_next = torch.tanh(r @ W_rec.t() + b_rec)           # (N, hidden_size)
-        energies = torch.sum(torch.square(r_next - r), dim=1) # (N,)
-        total_energy = energies.sum()
+    order = torch.argsort(scores)  # best first
+    points_sorted = points[order]
+    scores_sorted = scores[order]
 
-        total_energy.backward()
-        optimizer.step()
+    dists = torch.cdist(points_sorted, points_sorted)
+    keep = torch.ones(points_sorted.shape[0], dtype=torch.bool, device=points.device)
 
-        # stop early if every candidate has converged
-        if energies.max().item() < tol:
-            break
-
-    # ---- filter converged points ---------------------------------------------
-    with torch.no_grad():
-        r_next = torch.tanh(r @ W_rec.t() + b_rec)
-        energies = torch.sum(torch.square(r_next - r), dim=1)
-        converged_mask = energies < tol
-
-    if not converged_mask.any():
-        return np.array([])
-
-    fps = r[converged_mask].detach()  # (M, hidden_size)
-
-    # ---- remove duplicates (vectorized pairwise check) -----------------------
-    dists = torch.cdist(fps, fps)                       # (M, M)
-    keep = torch.ones(fps.shape[0], dtype=torch.bool)
-    for i in range(fps.shape[0]):
+    for i in range(points_sorted.shape[0]):
         if not keep[i]:
             continue
-        # mark later duplicates
         keep[i + 1:] &= dists[i, i + 1:] >= dup_thresh
 
-    unique_fps = fps[keep].cpu().numpy()
-    return unique_fps
-
+    return points_sorted[keep], scores_sorted[keep]
 
 
 def g_residual(r, W, b):
-    """g(r) = -r + tanh(r W^T + b)."""
+    """g(r) = -r + tanh(r W^T + b). Supports (H,) and (N,H)."""
     a = r @ W.t() + b
     g = -r + torch.tanh(a)
     return g, a
@@ -89,13 +57,15 @@ def S_and_residual(r, W, b):
 
 
 def solve_fixed_point_gd(
-    r0, W, b,
+    r0,
+    W,
+    b,
     lr=1e-2,
     max_steps=4000,
     tol_S=1e-10,
     patience=300,
 ):
-    """Minimize S(r) by Adam starting from r0."""
+    """Minimize S(r) by Adam starting from a single seed r0."""
     Wc = W.detach()
     bc = b.detach()
 
@@ -120,31 +90,18 @@ def solve_fixed_point_gd(
         else:
             stall += 1
 
-        if sval < tol_S:
-            break
-        if stall >= patience:
+        if sval < tol_S or stall >= patience:
             break
 
     r_star = best_r if best_r is not None else r.detach().clone()
     with torch.no_grad():
         S_final, g_final = S_and_residual(r_star, Wc, bc)
-        return r_star, float(S_final.cpu()), float(torch.norm(g_final).cpu())
-
-
-
-
+    return r_star, float(S_final.cpu()), float(torch.norm(g_final).cpu())
 
 
 @torch.no_grad()
 def newton_refine(r_init, W, b, steps=20, ridge=1e-6, damping=1.0, tol=1e-12):
-    """Newton refinement for g(r)=0.
-
-    Uses analytic Jacobian:
-      J_g = -I + diag(sech^2(a)) W, where a = r W^T + b.
-
-    ridge adds a small multiple of I for numerical stability.
-    damping allows a damped Newton step if needed.
-    """
+    """Newton refinement for a single point r_init."""
     r = r_init.clone()
     H = r.numel()
     I = torch.eye(H, device=r.device, dtype=r.dtype)
@@ -154,39 +111,33 @@ def newton_refine(r_init, W, b, steps=20, ridge=1e-6, damping=1.0, tol=1e-12):
         if torch.norm(g) < tol:
             break
 
-        d = 1.0 - torch.tanh(a) ** 2           # sech^2(a)
-        J = -I + (d.unsqueeze(1) * W)          # diag(d) @ W
-
+        d = 1.0 - torch.tanh(a) ** 2
+        J = -I + (d.unsqueeze(1) * W)
         J_reg = J + ridge * I
+
         try:
             delta = torch.linalg.solve(J_reg, g)
         except RuntimeError:
             delta = torch.linalg.lstsq(J_reg, g).solution
 
-        r_new = r - damping * delta
-
-        # basic safeguard: keep the step if residual decreases
-        g_new, _ = g_residual(r_new, W, b)
-        if torch.norm(g_new) <= torch.norm(g):
-            r = r_new
-        else:
-            r = r_new  # accept anyway; you can implement stronger line search if desired
+        r = r - damping * delta
 
     return r
 
 
 def solve_fixed_point_hybrid(
-    r0, W, b,
-    gd_steps=1000,
+    r0,
+    W,
+    b,
+    gd_steps=100,
     gd_lr=1e-2,
     tol_S=1e-10,
     patience=300,
-    newton_steps=20,
+    newton_steps=5,
     newton_ridge=1e-6,
     newton_damping=1.0,
 ):
-    """Gradient descent on S(r) followed by Newton refinement on g(r)=0."""
-    # run GD with a hard cap gd_steps
+    """Single-seed GD->Newton hybrid solve."""
     Wc = W.detach()
     bc = b.detach()
 
@@ -211,16 +162,14 @@ def solve_fixed_point_hybrid(
         else:
             stall += 1
 
-        if sval < tol_S:
-            break
-        if stall >= patience:
+        if sval < tol_S or stall >= patience:
             break
 
     r_star = best_r if best_r is not None else r.detach().clone()
-
-    # Newton refinement (optional)
     r_star = newton_refine(
-        r_star, Wc, bc,
+        r_star,
+        Wc,
+        bc,
         steps=newton_steps,
         ridge=newton_ridge,
         damping=newton_damping,
@@ -228,7 +177,138 @@ def solve_fixed_point_hybrid(
 
     with torch.no_grad():
         S_final, g_final = S_and_residual(r_star, Wc, bc)
-        return r_star, float(S_final.cpu()), float(torch.norm(g_final).cpu())
+    return r_star, float(S_final.cpu()), float(torch.norm(g_final).cpu())
+
+
+@torch.no_grad()
+def _newton_refine_batched(r_init, W, b, steps=5, ridge=1e-6, damping=1.0, tol=1e-10):
+    """Batched Newton refinement for r of shape (N,H)."""
+    r = r_init.clone()
+    if r.numel() == 0:
+        return r
+
+    N, H = r.shape
+    I = torch.eye(H, device=r.device, dtype=r.dtype).unsqueeze(0).expand(N, -1, -1)
+
+    for _ in range(steps):
+        a = r @ W.t() + b
+        g = -r + torch.tanh(a)
+        g_norm = torch.linalg.norm(g, dim=1)
+        if torch.max(g_norm).item() < tol:
+            break
+
+        d = 1.0 - torch.tanh(a) ** 2  # (N,H)
+        J = -I + d.unsqueeze(2) * W.unsqueeze(0)  # (N,H,H)
+        J_reg = J + ridge * I
+
+        rhs = g.unsqueeze(-1)
+        try:
+            delta = torch.linalg.solve(J_reg, rhs).squeeze(-1)
+        except RuntimeError:
+            delta = torch.linalg.lstsq(J_reg, rhs).solution.squeeze(-1)
+
+        r = r - damping * delta
+
+    return r
+
+
+def find_fixed_points_hybrid(
+    model,
+    sample_states,
+    gd_lr=1e-2,
+    gd_steps=100,
+    newton_steps=5,
+    tol=1e-9,
+    dup_thresh=0.1,
+    newton_ridge=1e-6,
+    newton_damping=1.0,
+    return_details=False,
+):
+    """
+    Vectorized fixed-point finder with 2 stages:
+      1) batched GD minimization of S(r)=||-r+tanh(rW^T+b)||^2
+      2) batched Newton refinement on g(r)=0
+
+    Defaults use 100 GD steps + 5 Newton steps.
+    """
+    W = model.W_rec.detach()
+    b = model.b_rec.detach()
+
+    seeds = _flatten_states(sample_states, model.hidden_size).to(W.device, dtype=W.dtype)
+    if seeds.shape[0] == 0:
+        if return_details:
+            return np.empty((0, model.hidden_size)), {
+                "energies": np.array([]),
+                "residual_norms": np.array([]),
+                "converged_mask": np.array([], dtype=bool),
+            }
+        return np.empty((0, model.hidden_size))
+
+    r = seeds.clone().detach().requires_grad_(True)
+    opt = torch.optim.Adam([r], lr=gd_lr)
+
+    for _ in range(gd_steps):
+        opt.zero_grad()
+        r_next = torch.tanh(r @ W.t() + b)
+        residual = r_next - r
+        energies = torch.sum(residual * residual, dim=1)
+        loss = energies.sum()
+        loss.backward()
+        opt.step()
+
+    with torch.no_grad():
+        r_refined = _newton_refine_batched(
+            r.detach(),
+            W,
+            b,
+            steps=newton_steps,
+            ridge=newton_ridge,
+            damping=newton_damping,
+            tol=max(1e-12, np.sqrt(tol)),
+        )
+
+        r_next = torch.tanh(r_refined @ W.t() + b)
+        residual = r_next - r_refined
+        energies = torch.sum(residual * residual, dim=1)
+        residual_norms = torch.linalg.norm(residual, dim=1)
+        converged_mask = energies < tol
+
+        fps = r_refined[converged_mask]
+        fps_scores = energies[converged_mask]
+
+        if fps.shape[0] > 0:
+            fps, fps_scores = _deduplicate_points(fps, fps_scores, dup_thresh=dup_thresh)
+
+        fps_np = fps.cpu().numpy() if fps.shape[0] > 0 else np.empty((0, model.hidden_size))
+
+    if return_details:
+        details = {
+            "energies": energies.cpu().numpy(),
+            "residual_norms": residual_norms.cpu().numpy(),
+            "converged_mask": converged_mask.cpu().numpy(),
+            "unique_energies": fps_scores.cpu().numpy() if fps.shape[0] > 0 else np.array([]),
+        }
+        return fps_np, details
+
+    return fps_np
+
+
+def find_fixed_points_KE_min(model, sample_states, lr=0.1, max_iter=1000, tol=1e-9, dup_thresh=0.1):
+    """
+    Backward-compatible wrapper.
+
+    Keeps old signature but now uses the hybrid solver internally.
+    """
+    return find_fixed_points_hybrid(
+        model,
+        sample_states,
+        gd_lr=lr,
+        gd_steps=max_iter,
+        newton_steps=5,
+        tol=tol,
+        dup_thresh=dup_thresh,
+        return_details=False,
+    )
 
 
 @torch.no_grad()
@@ -238,9 +318,75 @@ def spectral_radius_leaky(r_star, W, b, alpha):
     I = torch.eye(H, device=r_star.device, dtype=r_star.dtype)
 
     a = r_star @ W.t() + b
-    d = 1.0 - torch.tanh(a) ** 2         # sech^2(a)
-    JF = d.unsqueeze(1) * W              # derivative of F(r)=tanh(r W^T + b)
+    d = 1.0 - torch.tanh(a) ** 2
+    JF = d.unsqueeze(1) * W
     J_leaky = (1.0 - alpha) * I + alpha * JF
 
     eigvals = torch.linalg.eigvals(J_leaky)
     return torch.max(torch.abs(eigvals)).item()
+
+
+@torch.no_grad()
+def classify_fixed_points_stability(model, fixed_points, alpha=None, marginal_eps=1e-3):
+    """
+    Classify fixed points by Jacobian spectral radius.
+
+    Returns dict with:
+      - spectral_radius: (M,)
+      - is_stable: (M,) boolean
+      - labels: (M,) string in {"stable", "marginal", "unstable"}
+    """
+    if fixed_points is None:
+        return {
+            "spectral_radius": np.array([]),
+            "is_stable": np.array([], dtype=bool),
+            "labels": np.array([], dtype=object),
+        }
+
+    if isinstance(fixed_points, np.ndarray):
+        if fixed_points.size == 0:
+            return {
+                "spectral_radius": np.array([]),
+                "is_stable": np.array([], dtype=bool),
+                "labels": np.array([], dtype=object),
+            }
+        fps = torch.from_numpy(fixed_points).to(model.W_rec.device, dtype=model.W_rec.dtype)
+    else:
+        fps = fixed_points.to(model.W_rec.device, dtype=model.W_rec.dtype)
+        if fps.numel() == 0:
+            return {
+                "spectral_radius": np.array([]),
+                "is_stable": np.array([], dtype=bool),
+                "labels": np.array([], dtype=object),
+            }
+
+    if fps.dim() == 1:
+        fps = fps.unsqueeze(0)
+
+    if alpha is None:
+        alpha = float(getattr(model, "alpha", 1.0))
+
+    W = model.W_rec.detach()
+    b = model.b_rec.detach()
+
+    N, H = fps.shape
+    I = torch.eye(H, device=fps.device, dtype=fps.dtype).unsqueeze(0).expand(N, -1, -1)
+
+    a = fps @ W.t() + b
+    d = 1.0 - torch.tanh(a) ** 2
+    JF = d.unsqueeze(2) * W.unsqueeze(0)
+    J = (1.0 - alpha) * I + alpha * JF
+
+    eigvals = torch.linalg.eigvals(J)
+    rho = torch.abs(eigvals).amax(dim=1)
+
+    rho_np = rho.cpu().numpy()
+    labels = np.full(rho_np.shape, "unstable", dtype=object)
+    labels[rho_np < (1.0 - marginal_eps)] = "stable"
+    labels[np.abs(rho_np - 1.0) <= marginal_eps] = "marginal"
+
+    return {
+        "spectral_radius": rho_np,
+        "is_stable": rho_np < 1.0,
+        "labels": labels,
+    }
