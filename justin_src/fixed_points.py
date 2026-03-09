@@ -218,7 +218,7 @@ def find_fixed_points_hybrid(
     gd_lr=1e-2,
     gd_steps=100,
     newton_steps=5,
-    tol=1e-9,
+    tol=1e-4,
     dup_thresh=0.1,
     newton_ridge=1e-6,
     newton_damping=1.0,
@@ -283,6 +283,7 @@ def find_fixed_points_hybrid(
 
     if return_details:
         details = {
+            "r_refined": r_refined,
             "energies": energies.cpu().numpy(),
             "residual_norms": residual_norms.cpu().numpy(),
             "converged_mask": converged_mask.cpu().numpy(),
@@ -293,22 +294,76 @@ def find_fixed_points_hybrid(
     return fps_np
 
 
-def find_fixed_points_KE_min(model, sample_states, lr=0.1, max_iter=1000, tol=1e-9, dup_thresh=0.1):
+def find_fixed_points_KE_min(model, sample_states, lr=0.1, max_iter=1000, tol=1e-8, dup_thresh=0.1):
     """
-    Backward-compatible wrapper.
+    Vectorized fixed-point finder via kinetic-energy minimization.
 
-    Keeps old signature but now uses the hybrid solver internally.
+    Uses the leaky RNN update rule:
+        r_{t+1} = (1-α)r_t + α tanh(r_t W^T + b)
+    so fixed points satisfy  r* = (1-α)r* + α tanh(r* W^T + b)
+    i.e.  r* = tanh(r* W^T + b)  (same equation regardless of α).
+
+    Stability is evaluated with the full leaky Jacobian:
+        J = (1-α)I + α diag(sech²(a)) W_rec
+
+    model: trained RNN model (must have .alpha, .W_rec, .b_rec)
+    sample_states: tensor of shape (num_samples, hidden_size) or (batch, T, hidden_size)
+    lr: learning rate for Adam
+    max_iter: maximum optimisation steps
+    tol: energy threshold to declare convergence
+    dup_thresh: L2 distance below which two fixed points are considered duplicates
     """
-    return find_fixed_points_hybrid(
-        model,
-        sample_states,
-        gd_lr=lr,
-        gd_steps=max_iter,
-        newton_steps=5,
-        tol=tol,
-        dup_thresh=dup_thresh,
-        return_details=False,
-    )
+
+    W_rec = model.W_rec.detach()
+    b_rec = model.b_rec.detach()
+    alpha = model.alpha
+
+    # Flatten to 2D: (total_samples, hidden_size)
+    if sample_states.dim() == 3:
+        sample_states = sample_states.reshape(-1, model.hidden_size)
+
+    # ---- batched optimisation ------------------------------------------------
+    r = sample_states.clone().detach().requires_grad_(True)  # (N, hidden_size)
+    optimizer = torch.optim.Adam([r], lr=lr)
+
+    for _ in range(max_iter):
+        optimizer.zero_grad()
+
+        r_next = torch.tanh(r @ W_rec.t() + b_rec)           # (N, hidden_size)
+        energies = torch.sum(torch.square(r_next - r), dim=1) # (N,)
+        total_energy = energies.sum()
+
+        total_energy.backward()
+        optimizer.step()
+
+        # stop early if every candidate has converged
+        if energies.max().item() < tol:
+            break
+
+    # ---- filter converged points ---------------------------------------------
+    with torch.no_grad():
+        r_next = torch.tanh(r @ W_rec.t() + b_rec)
+        energies = torch.sum(torch.square(r_next - r), dim=1)
+        converged_mask = energies < tol
+
+    if not converged_mask.any():
+        return np.array([])
+
+    fps = r[converged_mask].detach()  # (M, hidden_size)
+
+    # ---- remove duplicates (vectorized pairwise check) -----------------------
+    dists = torch.cdist(fps, fps)                       # (M, M)
+    keep = torch.ones(fps.shape[0], dtype=torch.bool)
+    for i in range(fps.shape[0]):
+        if not keep[i]:
+            continue
+        # mark later duplicates
+        keep[i + 1:] &= dists[i, i + 1:] >= dup_thresh
+
+    unique_fps = fps[keep]  # (K, hidden_size)
+    
+    return unique_fps.cpu().numpy()
+
 
 
 @torch.no_grad()
@@ -390,3 +445,76 @@ def classify_fixed_points_stability(model, fixed_points, alpha=None, marginal_ep
         "is_stable": rho_np < 1.0,
         "labels": labels,
     }
+
+
+def find_slow_points(
+    model,
+    sample_states,
+    gd_lr=1e-2,
+    gd_steps=500,
+    fp_tol=1e-4,
+    slow_tol=1e-1,
+    fp_dup_thresh=0.1,
+    slow_dup_thresh=0.5,
+):
+    """
+    Find both fixed points and slow points via GD energy minimization.
+
+    Fixed points have energy < fp_tol; slow points have fp_tol <= energy < slow_tol.
+    Both sets are deduplicated independently.
+
+    Delegates to find_fixed_points_hybrid (with newton_steps=0) for the GD
+    optimization, then partitions the refined points by energy.
+
+    Parameters:
+    -----------
+    model : RNN
+        The trained RNN model (must have .W_rec, .b_rec, .hidden_size)
+    sample_states : torch.Tensor
+        Initial seeds of shape (N, hidden_size) or (B, T, hidden_size)
+    gd_lr : float
+        Learning rate for Adam optimizer
+    gd_steps : int
+        Number of GD optimization steps
+    fp_tol : float
+        Energy threshold for true fixed points
+    slow_tol : float
+        Energy threshold for slow points (upper bound)
+    fp_dup_thresh : float
+        Deduplication distance for fixed points
+    slow_dup_thresh : float
+        Deduplication distance for slow points
+
+    Returns:
+    --------
+    fps_np : np.ndarray
+        Deduplicated fixed points, shape (n_fps, hidden_size)
+    slow_np : np.ndarray
+        Deduplicated slow points, shape (n_slow, hidden_size)
+    """
+    H = model.hidden_size
+
+    fps_np, details = find_fixed_points_hybrid(
+        model, sample_states,
+        gd_lr=gd_lr, gd_steps=gd_steps, newton_steps=0,
+        tol=fp_tol, dup_thresh=fp_dup_thresh,
+        return_details=True,
+    )
+
+    # Extract slow points from the refined candidates
+    r_refined = details["r_refined"]
+    if r_refined.shape[0] == 0:
+        return fps_np, np.empty((0, H))
+
+    energies = torch.from_numpy(details["energies"])
+    slow_mask = (energies >= fp_tol) & (energies < slow_tol)
+
+    if slow_mask.any():
+        slow_pts = r_refined[slow_mask]
+        slow_E = energies[slow_mask].to(slow_pts.device)
+        slow_pts, slow_E = _deduplicate_points(slow_pts, slow_E, slow_dup_thresh)
+        slow_np = slow_pts.cpu().numpy()
+    else:
+        slow_np = np.empty((0, H))
+
+    return fps_np, slow_np

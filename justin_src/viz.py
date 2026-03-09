@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter, PillowWriter
-from fixed_points import find_fixed_points_KE_min
+from fixed_points import find_fixed_points_KE_min, find_fixed_points_hybrid, find_slow_points
 
 def fit_pca(R_list):
     pca = PCA(n_components=2)
@@ -117,6 +117,98 @@ def animate_R(R_list, interval=50, fixed_points=None, save_path=None, fps=20, st
     return pca, lim
 
 
+def find_fixed_points_over_epochs(rnn, train_R_list, stride=1, weight_snapshots=None,
+                                  fp_finder=None, fp_kwargs=None,
+                                  n_random_seeds=200, n_carry_forward=3):
+    """
+    Find fixed points at each sampled epoch over training.
+
+    Parameters:
+    -----------
+    rnn : RNN
+        The trained RNN model
+    train_R_list : list
+        List of hidden state tensors, one per epoch
+    stride : int
+        Subsample epochs by this factor
+    weight_snapshots : list of dict or None
+        Per-epoch weight snapshots from train_rnn. Each dict has 'W_rec' and 'b_rec'.
+        If None, uses rnn's current (final) weights for all epochs.
+    fp_finder : callable or None
+        Function to find fixed points. Default is find_fixed_points_hybrid.
+    fp_kwargs : dict or None
+        Extra kwargs passed to fp_finder
+    n_random_seeds : int
+        Number of random initial seeds to include (default 200)
+    n_carry_forward : int
+        Number of previous epochs' FPs to carry forward as seeds (default 3)
+
+    Returns:
+    --------
+    fps_per_epoch : list of np.ndarray
+        Fixed points found at each sampled epoch. Each array has shape (n_fps, hidden_size).
+    """
+    if fp_finder is None:
+        fp_finder = find_fixed_points_hybrid
+    if fp_kwargs is None:
+        fp_kwargs = {}
+
+    if stride > 1:
+        train_R_list = train_R_list[::stride]
+        if weight_snapshots is not None:
+            weight_snapshots = weight_snapshots[::stride]
+
+    n_epochs = len(train_R_list)
+    fps_per_epoch = []
+    recent_fps = []
+
+    print(f"Finding fixed points for {n_epochs} sampled epochs (stride={stride})...")
+    for i in range(n_epochs):
+        # Temporarily swap in per-epoch weights if available
+        if weight_snapshots is not None:
+            orig_W_rec = rnn.W_rec.data.clone()
+            orig_b_rec = rnn.b_rec.data.clone()
+            rnn.W_rec.data = weight_snapshots[i]['W_rec'].to(rnn.W_rec.device)
+            rnn.b_rec.data = weight_snapshots[i]['b_rec'].to(rnn.b_rec.device)
+
+        # Gather seeds: current + neighboring epochs + random seeds
+        start = max(0, i - 2)
+        initial_states = torch.cat(train_R_list[start:i+1], dim=0)
+        if n_random_seeds > 0:
+            random_seeds = torch.randn(n_random_seeds, rnn.hidden_size) * 0.5
+            initial_states = torch.cat([initial_states, random_seeds], dim=0)
+
+        # Include fixed points from previous epochs as seeds
+        for prev_fps in recent_fps[-n_carry_forward:]:
+            if prev_fps.shape[0] > 0:
+                fps_tensor = torch.from_numpy(prev_fps).to(initial_states.dtype)
+                initial_states = torch.cat([initial_states, fps_tensor], dim=0)
+
+        fps_result = fp_finder(rnn, initial_states, **fp_kwargs)
+
+        # Restore original weights
+        if weight_snapshots is not None:
+            rnn.W_rec.data = orig_W_rec
+            rnn.b_rec.data = orig_b_rec
+
+        # Convert to numpy array
+        if isinstance(fps_result, list) and len(fps_result) > 0:
+            fps_arr = torch.cat(fps_result, dim=0).detach().cpu().numpy()
+        elif isinstance(fps_result, torch.Tensor):
+            fps_arr = fps_result.detach().cpu().numpy()
+        elif isinstance(fps_result, np.ndarray):
+            fps_arr = fps_result
+        else:
+            fps_arr = np.empty((0, rnn.hidden_size))
+
+        fps_per_epoch.append(fps_arr)
+        recent_fps.append(fps_arr)
+        if (i + 1) % 10 == 0:
+            print(f"  Epoch {(i+1) * stride}/{n_epochs * stride}: {fps_arr.shape[0]} fixed points")
+
+    return fps_per_epoch
+
+
 def animate_fixed_points(rnn, train_R_list, pca=None, save_path=None, fps=20, dpi=160,
                          show=False, lim=None, title=None, interval=100,
                          fp_finder=None, fp_kwargs=None, stride=1, weight_snapshots=None):
@@ -157,55 +249,11 @@ def animate_fixed_points(rnn, train_R_list, pca=None, save_path=None, fps=20, dp
         If None, uses rnn's current (final) weights for all epochs.
     """
 
-    if fp_finder is None:
-        fp_finder = find_fixed_points_KE_min
-    if fp_kwargs is None:
-        fp_kwargs = {}
-
-    # Subsample epochs by stride
-    if stride > 1:
-        train_R_list = train_R_list[::stride]
-        if weight_snapshots is not None:
-            weight_snapshots = weight_snapshots[::stride]
-
-    n_epochs = len(train_R_list)
-
-    # Find fixed points at each epoch
-    print(f"Finding fixed points for {n_epochs * stride} epochs...")
-    fps_per_epoch = []
-    fps_list = None
-    for i in range(n_epochs):
-        # Temporarily swap in per-epoch weights if available
-        if weight_snapshots is not None:
-            orig_W_rec = rnn.W_rec.data.clone()
-            orig_b_rec = rnn.b_rec.data.clone()
-            rnn.W_rec.data = weight_snapshots[i]['W_rec'].to(rnn.W_rec.device)
-            rnn.b_rec.data = weight_snapshots[i]['b_rec'].to(rnn.b_rec.device)
-        
-        # Use the fixed points from previous epoch as initial conditions for fixed point finding
-        initial_states = train_R_list[i]
-        if fps_list is not None:
-            fps_tensor = torch.from_numpy(fps_list).to(initial_states[0].dtype)
-            initial_states = torch.cat([initial_states, fps_tensor], dim=0)
-        
-        fps_list = fp_finder(rnn, initial_states, **fp_kwargs)
-        
-        # Restore original weights
-        if weight_snapshots is not None:
-            rnn.W_rec.data = orig_W_rec
-            rnn.b_rec.data = orig_b_rec
-        # Convert list of tensors to numpy array
-        if isinstance(fps_list, list) and len(fps_list) > 0:
-            fps_arr = torch.cat(fps_list, dim=0).detach().cpu().numpy()
-        elif isinstance(fps_list, torch.Tensor):
-            fps_arr = fps_list.detach().cpu().numpy()
-        elif isinstance(fps_list, np.ndarray):
-            fps_arr = fps_list
-        else:
-            fps_arr = np.empty((0, rnn.hidden_size))
-        fps_per_epoch.append(fps_arr)
-        if (i + 1) % 10 == 0:
-            print(f"  Epoch {(i+1) * stride}/{n_epochs * stride}: {fps_arr.shape[0]} fixed points")
+    fps_per_epoch = find_fixed_points_over_epochs(
+        rnn, train_R_list, stride=stride, weight_snapshots=weight_snapshots,
+        fp_finder=fp_finder, fp_kwargs=fp_kwargs,
+    )
+    n_epochs = len(fps_per_epoch)
 
     # Fit PCA on all fixed points combined
     if pca is None:
@@ -294,6 +342,426 @@ def animate_fixed_points(rnn, train_R_list, pca=None, save_path=None, fps=20, dp
         plt.close(fig)
 
     return pca, lim
+
+
+def plot_num_fixed_points(rnn, train_R_list, stride=1, weight_snapshots=None,
+                          fp_finder=None, fp_kwargs=None, save_path=None,
+                          title=None, show=True):
+    """
+    Plot the number of fixed points found at each epoch over training.
+
+    Parameters:
+    -----------
+    rnn : RNN
+        The trained RNN model
+    train_R_list : list
+        List of hidden state tensors, one per epoch
+    stride : int
+        Subsample epochs by this factor
+    weight_snapshots : list of dict or None
+        Per-epoch weight snapshots from train_rnn
+    fp_finder : callable or None
+        Fixed-point finder function. Default is find_fixed_points_KE_min.
+    fp_kwargs : dict or None
+        Extra kwargs passed to fp_finder
+    save_path : str or None
+        If provided, saves the figure to this path
+    title : str or None
+        Plot title
+    show : bool
+        Whether to display the plot
+    """
+    fps_per_epoch = find_fixed_points_over_epochs(
+        rnn, train_R_list, stride=stride, weight_snapshots=weight_snapshots,
+        fp_finder=fp_finder, fp_kwargs=fp_kwargs,
+    )
+    n_epochs = len(fps_per_epoch)
+    epoch_indices = [(i + 1) * stride for i in range(n_epochs)]
+    num_fps = [fp.shape[0] for fp in fps_per_epoch]
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(epoch_indices, num_fps, 'o-', markersize=4, linewidth=1.5, color='C0')
+    ax.set_xlabel('Epoch', fontsize=12)
+    ax.set_ylabel('Number of Fixed Points', fontsize=12)
+    ax.set_title(title or 'Number of Fixed Points Over Training', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.yaxis.get_major_locator().set_params(integer=True)
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=160, bbox_inches='tight')
+        print(f"Figure saved to {save_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return epoch_indices, num_fps
+
+
+def find_slow_points_over_epochs(rnn, train_R_list, stride=1, weight_snapshots=None,
+                                 n_random_seeds=2000, random_scale=1.0,
+                                 slow_kwargs=None):
+    """
+    Find fixed points and slow points at each sampled epoch over training.
+
+    Parameters:
+    -----------
+    rnn : RNN
+        The trained RNN model
+    train_R_list : list
+        List of hidden state tensors, one per epoch
+    stride : int
+        Subsample epochs by this factor
+    weight_snapshots : list of dict or None
+        Per-epoch weight snapshots from train_rnn
+    n_random_seeds : int
+        Number of random initial seeds to include (default 2000)
+    random_scale : float
+        Scale for random seeds (default 1.0)
+    slow_kwargs : dict or None
+        Extra kwargs passed to find_slow_points
+
+    Returns:
+    --------
+    fps_per_epoch : list of np.ndarray
+        Fixed points at each sampled epoch
+    slow_per_epoch : list of np.ndarray
+        Slow points at each sampled epoch
+    epoch_indices : list of int
+        The actual epoch indices sampled
+    """
+    if slow_kwargs is None:
+        slow_kwargs = {}
+
+    if stride > 1:
+        sampled_indices = list(range(0, len(train_R_list), stride))
+        if sampled_indices[-1] != len(train_R_list) - 1:
+            sampled_indices.append(len(train_R_list) - 1)
+    else:
+        sampled_indices = list(range(len(train_R_list)))
+
+    fps_per_epoch = []
+    slow_per_epoch = []
+
+    print(f"Finding slow points at {len(sampled_indices)} sampled epochs (stride={stride})...")
+    for ep in sampled_indices:
+        if weight_snapshots is not None:
+            orig_W_rec = rnn.W_rec.data.clone()
+            orig_b_rec = rnn.b_rec.data.clone()
+            rnn.W_rec.data = weight_snapshots[ep]['W_rec'].to(rnn.W_rec.device)
+            rnn.b_rec.data = weight_snapshots[ep]['b_rec'].to(rnn.b_rec.device)
+
+        seeds = train_R_list[ep]
+        if n_random_seeds > 0:
+            random_seeds = torch.randn(n_random_seeds, rnn.hidden_size) * random_scale
+            seeds = torch.cat([seeds, random_seeds], dim=0)
+
+        fps_np, slow_np = find_slow_points(rnn, seeds, **slow_kwargs)
+
+        if weight_snapshots is not None:
+            rnn.W_rec.data = orig_W_rec
+            rnn.b_rec.data = orig_b_rec
+
+        fps_per_epoch.append(fps_np)
+        slow_per_epoch.append(slow_np)
+        print(f"  Epoch {ep:>4d}: {fps_np.shape[0]} FPs, {slow_np.shape[0]} slow points")
+
+    return fps_per_epoch, slow_per_epoch, sampled_indices
+
+
+def plot_slow_points_state_space(fps_per_epoch, slow_per_epoch, epoch_indices,
+                                 pca=None, save_path=None, show=True, title=None):
+    """
+    Tiled panel plot of slow points and fixed points in PCA state space over epochs.
+
+    Parameters:
+    -----------
+    fps_per_epoch : list of np.ndarray
+        Fixed points at each epoch
+    slow_per_epoch : list of np.ndarray
+        Slow points at each epoch
+    epoch_indices : list of int
+        Epoch labels for each panel
+    pca : PCA or None
+        Pre-fitted PCA. If None, fits on all points.
+    save_path : str or None
+        If provided, saves figure
+    show : bool
+        Whether to display
+    title : str or None
+        Suptitle
+
+    Returns:
+    --------
+    pca : PCA
+        The fitted PCA object
+    """
+    # Fit PCA on all found points
+    all_points_list = (
+        [fp for fp in fps_per_epoch if fp.shape[0] > 0] +
+        [sp for sp in slow_per_epoch if sp.shape[0] > 0]
+    )
+    if not all_points_list:
+        print("No points found at any epoch.")
+        return pca
+
+    all_points = np.concatenate(all_points_list, axis=0)
+    if pca is None:
+        pca = PCA(n_components=2)
+        pca.fit(all_points)
+
+    # Project each epoch
+    fps_2d = [pca.transform(fp) if fp.shape[0] > 0 else np.empty((0, 2)) for fp in fps_per_epoch]
+    slow_2d = [pca.transform(sp) if sp.shape[0] > 0 else np.empty((0, 2)) for sp in slow_per_epoch]
+
+    # Layout
+    n_panels = len(epoch_indices)
+    ncols = min(6, n_panels)
+    nrows = int(np.ceil(n_panels / ncols))
+
+    # Axis limits
+    all_2d = np.concatenate([a for a in fps_2d + slow_2d if a.shape[0] > 0], axis=0)
+    margin = 0.5
+    xlim = (all_2d[:, 0].min() - margin, all_2d[:, 0].max() + margin)
+    ylim = (all_2d[:, 1].min() - margin, all_2d[:, 1].max() + margin)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows), squeeze=False)
+    for i, (ep, fp2, sp2) in enumerate(zip(epoch_indices, fps_2d, slow_2d)):
+        ax = axes[i // ncols][i % ncols]
+        if sp2.shape[0] > 0:
+            ax.scatter(sp2[:, 0], sp2[:, 1], c='dodgerblue', s=15, alpha=0.5, label='Slow pts')
+        if fp2.shape[0] > 0:
+            ax.scatter(fp2[:, 0], fp2[:, 1], c='red', marker='X', s=100, zorder=5, label='FPs')
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_title(f'Epoch {ep}', fontsize=10, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        if i == 0:
+            ax.legend(fontsize=8)
+
+    for i in range(n_panels, nrows * ncols):
+        axes[i // ncols][i % ncols].set_visible(False)
+
+    fig.supxlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=12)
+    fig.supylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', fontsize=12)
+    fig.suptitle(title or 'Slow Points & FPs in State Space', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=160, bbox_inches='tight')
+        print(f"Figure saved to {save_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return pca
+
+
+def animate_slow_points_state_space(fps_per_epoch, slow_per_epoch, epoch_indices,
+                                    pca=None, save_path=None, show=False, title=None,
+                                    fps=5, interval=200, figsize=(7, 6)):
+    """
+    Animated version of plot_slow_points_state_space: one frame per epoch in PCA space.
+
+    Parameters:
+    -----------
+    fps_per_epoch : list of np.ndarray
+        Fixed points at each epoch
+    slow_per_epoch : list of np.ndarray
+        Slow points at each epoch
+    epoch_indices : list of int
+        Epoch labels for each frame
+    pca : PCA or None
+        Pre-fitted 2-component PCA. If None, fits on all points.
+    save_path : str or None
+        If provided, saves the animation (.mp4 or .gif)
+    show : bool
+        Whether to display the animation (default False)
+    title : str or None
+        Base title for the plot
+    fps : int
+        Frames per second for saved animation (default 5)
+    interval : int
+        Milliseconds between frames when displaying (default 200)
+    figsize : tuple
+        Figure size (default (7, 6))
+
+    Returns:
+    --------
+    pca : PCA
+        The fitted PCA object
+    """
+    # Fit PCA on all found points
+    all_points_list = (
+        [fp for fp in fps_per_epoch if fp.shape[0] > 0] +
+        [sp for sp in slow_per_epoch if sp.shape[0] > 0]
+    )
+    if not all_points_list:
+        print("No points found at any epoch.")
+        return pca
+
+    all_points = np.concatenate(all_points_list, axis=0)
+    if pca is None:
+        pca = PCA(n_components=2)
+        pca.fit(all_points)
+
+    # Project each epoch
+    fps_2d = [pca.transform(fp) if fp.shape[0] > 0 else np.empty((0, 2)) for fp in fps_per_epoch]
+    slow_2d = [pca.transform(sp) if sp.shape[0] > 0 else np.empty((0, 2)) for sp in slow_per_epoch]
+
+    # Axis limits (fixed across all frames)
+    all_2d = np.concatenate([a for a in fps_2d + slow_2d if a.shape[0] > 0], axis=0)
+    margin = 0.5
+    xlim = (all_2d[:, 0].min() - margin, all_2d[:, 0].max() + margin)
+    ylim = (all_2d[:, 1].min() - margin, all_2d[:, 1].max() + margin)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=12)
+    ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', fontsize=12)
+    ax.grid(True, alpha=0.3)
+
+    slow_scatter = ax.scatter([], [], c='dodgerblue', s=15, alpha=0.5, label='Slow pts')
+    fp_scatter = ax.scatter([], [], c='red', marker='X', s=100, zorder=5, label='FPs')
+    ax.legend(fontsize=9, loc='upper right')
+
+    base_title = title or 'Slow Points & FPs in State Space'
+    epoch_text = ax.set_title(f'{base_title} — Epoch {epoch_indices[0]}',
+                              fontsize=13, fontweight='bold')
+
+    def update(frame_idx):
+        ep = epoch_indices[frame_idx]
+        sp2 = slow_2d[frame_idx]
+        fp2 = fps_2d[frame_idx]
+
+        slow_scatter.set_offsets(sp2 if sp2.shape[0] > 0 else np.empty((0, 2)))
+        fp_scatter.set_offsets(fp2 if fp2.shape[0] > 0 else np.empty((0, 2)))
+        ax.set_title(f'{base_title} — Epoch {ep}', fontsize=13, fontweight='bold')
+        return slow_scatter, fp_scatter
+
+    n_frames = len(epoch_indices)
+    print(f"Generating animation with {n_frames} frames...")
+    anim = FuncAnimation(fig, update, frames=n_frames, interval=interval, blit=False)
+
+    if save_path:
+        print(f"Saving animation to {save_path}...")
+        if save_path.endswith('.gif'):
+            writer = PillowWriter(fps=fps)
+        else:
+            writer = FFMpegWriter(fps=fps, metadata={'title': base_title})
+        anim.save(save_path, writer=writer, dpi=160)
+        print(f"Animation saved to {save_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return pca
+
+
+def plot_slow_points_state_space_3d(fps_per_epoch, slow_per_epoch, epoch_indices,
+                                    pca=None, save_path=None, show=True, title=None,
+                                    elev=25, azim=135):
+    """
+    Tiled 3D panel plot of slow points and fixed points in PCA state space over epochs.
+
+    Parameters:
+    -----------
+    fps_per_epoch : list of np.ndarray
+        Fixed points at each epoch
+    slow_per_epoch : list of np.ndarray
+        Slow points at each epoch
+    epoch_indices : list of int
+        Epoch labels for each panel
+    pca : PCA or None
+        Pre-fitted 3-component PCA. If None, fits on all points.
+    save_path : str or None
+        If provided, saves figure
+    show : bool
+        Whether to display
+    title : str or None
+        Suptitle
+
+    Returns:
+    --------
+    pca : PCA
+        The fitted PCA object (n_components=3)
+    """
+    all_points_list = (
+        [fp for fp in fps_per_epoch if fp.shape[0] > 0] +
+        [sp for sp in slow_per_epoch if sp.shape[0] > 0]
+    )
+    if not all_points_list:
+        print("No points found at any epoch.")
+        return pca
+
+    all_points = np.concatenate(all_points_list, axis=0)
+    if pca is None:
+        pca = PCA(n_components=3)
+        pca.fit(all_points)
+
+    fps_3d = [pca.transform(fp) if fp.shape[0] > 0 else np.empty((0, 3)) for fp in fps_per_epoch]
+    slow_3d = [pca.transform(sp) if sp.shape[0] > 0 else np.empty((0, 3)) for sp in slow_per_epoch]
+
+    n_panels = len(epoch_indices)
+    ncols = min(6, n_panels)
+    nrows = int(np.ceil(n_panels / ncols))
+
+    all_3d = np.concatenate([a for a in fps_3d + slow_3d if a.shape[0] > 0], axis=0)
+    margin = 0.5
+    xlim = (all_3d[:, 0].min() - margin, all_3d[:, 0].max() + margin)
+    ylim = (all_3d[:, 1].min() - margin, all_3d[:, 1].max() + margin)
+    zlim = (all_3d[:, 2].min() - margin, all_3d[:, 2].max() + margin)
+
+    fig = plt.figure(figsize=(5 * ncols, 5 * nrows))
+    for i, (ep, fp3, sp3) in enumerate(zip(epoch_indices, fps_3d, slow_3d)):
+        ax = fig.add_subplot(nrows, ncols, i + 1, projection='3d')
+        if sp3.shape[0] > 0:
+            ax.scatter(sp3[:, 0], sp3[:, 1], sp3[:, 2],
+                       c='dodgerblue', s=10, alpha=0.4, label='Slow pts')
+        if fp3.shape[0] > 0:
+            ax.scatter(fp3[:, 0], fp3[:, 1], fp3[:, 2],
+                       c='red', marker='X', s=120, zorder=5, label='FPs')
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_zlim(zlim)
+        ax.set_title(f'Epoch {ep}', fontsize=10, fontweight='bold')
+        ax.set_xlabel(f'PC1', fontsize=8)
+        ax.set_ylabel(f'PC2', fontsize=8)
+        ax.set_zlabel(f'PC3', fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.view_init(elev=elev, azim=azim)
+        if i == 0:
+            ax.legend(fontsize=8)
+
+    # Hide unused panels
+    for i in range(n_panels, nrows * ncols):
+        ax_hide = fig.add_subplot(nrows, ncols, i + 1)
+        ax_hide.set_visible(False)
+
+    evr = pca.explained_variance_ratio_
+    fig.suptitle(
+        (title or 'Slow Points & FPs in 3D State Space') +
+        f'\n(PC1: {evr[0]:.1%}, PC2: {evr[1]:.1%}, PC3: {evr[2]:.1%})',
+        fontsize=14, fontweight='bold')
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=160, bbox_inches='tight')
+        print(f"Figure saved to {save_path}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return pca
 
 
 def viz_R(R_list, batch_idx=0):

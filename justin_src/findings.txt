@@ -1,0 +1,165 @@
+Finding: Reinitialization Changes Dynamical Structure Despite Similar Task Performance
+=====================================================================================
+Date: March 3, 2026
+
+Setup
+-----
+- 1-bit flip-flop task, batch_size=32, hidden_size=100, use_bias=True
+- First training: 1000 epochs, lr=1e-2 → loss ≈ 0.001
+- Reinitialization: W_in, W_out, b_out reinitalized with prob=1.0
+- Second training: 1000 epochs, lr=1e-2 → loss ≈ 0.0006
+
+Observation
+-----------
+After first training, the network consistently has 3 fixed points at every epoch
+(two stable attractors near output ±1, one unstable at the origin). This is the
+classic bistable flip-flop solution.
+
+After full reinitialization and retraining, the network has only 1 true fixed point
+(near the origin, output ≈ -0.021 ≈ 0), despite achieving even lower loss.
+
+Diagnostic Details
+------------------
+First training (final epoch):
+- 53232 seeds tested → 53232/53232 converge → 3 FPs
+- Readouts: [-0.043] (saddle), [0.663] (stable), [-0.714] (stable)
+
+Second training (final epoch):
+- 5232 seeds tested (3232 trajectory + 2000 random at scales 0.1, 0.5, 1.0, 2.0)
+- 4490/5232 seeds converge (energy < 1e-4), ALL to the same single fixed point
+- Energy gap: true FP at ~1e-14, next lowest energy at ~1.3e-4
+- 180 unique slow points found (energy 1e-4 to 0.1), but none cluster near ±1
+- Slow point outputs are widely scattered, not concentrated at task-relevant values
+
+Interpretation
+--------------
+                  | First training                          | After reinit + retrain
+------------------|-----------------------------------------|----------------------------------
+Fixed points      | 3 (two stable at ±1, one unstable at 0) | 1 (near origin)
+Mechanism         | Classic bistable attractors             | Slow manifold / transient dynamics
+Loss              | 0.001                                   | 0.0006
+
+The reinitialized network solves the flip-flop task using continuous slow dynamics
+along a manifold rather than discrete fixed-point attractors. The qualitative
+dynamical structure changes fundamentally even when task performance is comparable
+(or better).
+
+Implication for "When to Reuse"
+-------------------------------
+Reinitializing input/output weights while preserving recurrent weights does not
+preserve the fixed-point attractor landscape. The network finds a qualitatively
+different dynamical solution, suggesting that the "reusable" computation encoded
+in W_rec may be repurposed into a different dynamical regime by the new readout.
+
+Could We Be Missing Fixed Points? (Validation Tests)
+-----------------------------------------------------
+Concern: The solver might fail to find FPs that genuinely exist.
+
+Evidence against (from current diagnostics):
+- 5232 seeds tested including random at 4 scales → all converge to the same FP
+- 4490/5232 seeds converge (86%) → high convergence rate
+- Energy gap is 10 orders of magnitude (1e-14 vs 1.3e-4) → no near-misses
+- 500 GD steps + 20 Newton steps → generous optimization budget
+
+Proposed validation tests:
+
+1. DIRECT RESIDUAL CHECK (definitive, no optimization needed)
+   Take the 3 FPs found during first training (r1*, r2*, r3*).
+   Evaluate ||r* - tanh(r* W_rec' + b_rec')|| using the 2nd training's weights.
+   If residual is near zero → FPs exist but solver fails (code bug).
+   If residual is large → FPs genuinely don't exist under new weights.
+   NOTE: W_rec and b_rec are NOT reinitialized, so this tests whether the
+   reinitialization of W_in/W_out/b_out indirectly shifted FPs via training.
+
+2. SEED FROM FIRST TRAINING'S FPs
+   Use the 3 known FPs as explicit seeds in find_fixed_points_hybrid with
+   the 2nd training's weights. If they converge to 3 distinct points, our
+   random seeding strategy has a coverage problem.
+
+3. WEIGHT INTERPOLATION (homotopy/continuation)
+   Interpolate: W(λ) = (1-λ)W_first + λ*W_second for λ in [0, 1].
+   Track FPs at each λ step. This reveals exactly where FPs appear/disappear
+   (saddle-node or pitchfork bifurcations) and whether FPs merge or vanish.
+
+4. BRUTE-FORCE SCALE TEST
+   Run with 50k+ random seeds. If the count stays at 1, coverage is not
+   the issue.
+
+Priority: Test 1 first (simplest, most conclusive). If it shows large
+residuals, the finding is confirmed. Tests 2-4 provide additional confidence.
+
+Validation Results (Updated March 3, 2026)
+--------------------------------------------
+Using properly separated weight_snapshots1 (1st training) and weight_snapshots2
+(2nd training) to avoid the earlier issue of using weight_snapshots2[0] as a
+proxy for the first training's final weights.
+
+All tests confirm: the missing FPs are genuinely destroyed, not missed by the solver.
+
+Weight continuity check:
+  W_rec gap (1st training final vs 2nd training epoch 0): 1.00
+  b_rec gap (1st training final vs 2nd training epoch 0): 0.10
+  → The very first gradient step of the 2nd training already shifts W_rec/b_rec.
+  W_rec total change (1st final vs 2nd final): 9.92
+  b_rec total change (1st final vs 2nd final): 0.63
+
+Test 4 - Brute Force (53,232 seeds at 5 scales: 0.1, 0.5, 1.0, 2.0, 5.0):
+  1st training FINAL weights: 53232/53232 converge → 3 FPs
+    Readouts: [-0.043], [0.663], [-0.714]
+    (saddle near 0, two stable attractors at +0.66 / -0.71)
+  2nd training FINAL weights: 40645/53232 converge → 1 FP
+    Readout: [-0.024]
+    (single near-origin FP)
+
+Test 1 - Direct Residual Check (1st training's 3 FPs under both weight sets):
+  FP#   Output     Resid(1st wts)   Resid(2nd wts)   Verdict
+  1     [-0.043]   4.30e-08         6.96e-01         DESTROYED
+  2     [ 0.663]   3.69e-07         7.86e+00         DESTROYED
+  3     [-0.714]   3.95e-07         7.90e+00         DESTROYED
+  → All 3 are genuine FPs under 1st training weights (residual ~1e-7),
+    but all have massive residuals under 2nd training weights.
+
+Test 2 - Seed from 1st training's FPs with 2nd training weights:
+  Seeding from the 3 known FPs → converges to 1 FP (output=-0.024).
+  The two stable attractors (±0.7) have no successor under the new weights.
+
+Test 3 - Continuation / Homotopy (definitive, coverage-independent):
+  Concern: Tests 1, 2, and 4 all rely on seeding the solver from candidate
+  locations. In 100 dimensions, even 53k seeds is sparse — FPs with small
+  basins of attraction could be missed regardless of seed count.
+
+  Resolution: Interpolate W_rec and b_rec between 1st training's final
+  weights (α=0) and 2nd training's final weights (α=1) in 100 steps.
+  At each step, seed the solver from the PREVIOUS step's FPs plus small
+  perturbations (scale 0.01). This tracks FPs as they continuously move
+  through state space, independent of search coverage.
+
+  Result:
+    α = 0.000 → 0.051:  3 FPs (tracked from known ground truth)
+    α = 0.061:           3 → 1 FPs  ← SADDLE-NODE BIFURCATION
+    α = 0.061 → 1.000:  1 FP (stable through remaining 94% of interpolation)
+
+  The two stable attractors (readouts ±0.7) are annihilated via a saddle-node
+  bifurcation very early in the weight interpolation — only ~6% of the way
+  from 1st to 2nd training weights. After that point, only the single
+  near-origin FP exists in the entire state space.
+
+  This is the strongest possible evidence: we directly observe the bifurcation
+  event by continuously following each FP. The FPs don't drift to unreachable
+  locations — they cease to exist.
+
+Conclusion
+----------
+CONFIRMED — the 1st training produces a classic bistable flip-flop (3 FPs:
+saddle + two attractors). After reinitialization of W_in/W_out/b_out and
+retraining, W_rec/b_rec change by ||ΔW||=9.92, completely destroying the
+bifurcation structure. The continuation test directly observes the saddle-node
+bifurcation at α ≈ 0.06 — the two stable attractors are annihilated early
+in the weight change, and no amount of further search can recover them because
+they genuinely do not exist.
+
+The network retains only 1 FP and solves the task via slow transient dynamics
+along a manifold rather than discrete attractors. This qualitative change in
+dynamical mechanism occurs despite comparable (or better) task performance,
+indicating that the "reusable" recurrent computation is fundamentally
+restructured during retraining.

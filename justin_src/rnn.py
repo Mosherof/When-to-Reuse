@@ -124,16 +124,21 @@ class RNN(nn.Module):
             self.register_buffer('b_rec', torch.zeros(hidden_size))
             self.register_buffer('b_out', torch.zeros(output_size))
     
-    def reinitialize_weights(self, weights=None):
+    def reinitialize_weights(self, weights=None, prob=1.0):
         """
-        Reinitialize specified weight matrices.
+        Reinitialize specified weight matrices element-wise with a given probability.
         
         Parameters:
         -----------
-        weights (list or str):  List of weight names to reinitialize. Options: 'W_rec', 'W_in', 'W_out', 'b_rec', 'b_out'.
+        weights : list of str or None
+            List of weight names to reinitialize. Options: 'W_rec', 'W_in', 'W_out', 'b_rec', 'b_out'.
             If None, reinitializes all weights.
+        prob : float in [0, 1]
+            Probability that each individual element is reinitialized.
+            prob=1.0 reinitializes every element (full reset).
+            prob=0.0 keeps all elements unchanged.
         """
-        print(f"Reinitializing weights: {weights if weights is not None else 'all'}")
+        print(f"Reinitializing weights: {weights if weights is not None else 'all'} (prob={prob})")
         if weights is None:
             weights = ['W_rec', 'W_in', 'W_out']
             if self.use_bias:
@@ -143,19 +148,29 @@ class RNN(nn.Module):
         
         for weight in weights:
             if weight == 'W_rec':
-                self.W_rec.data = torch.randn(self.hidden_size, self.hidden_size) * std
+                param = self.W_rec
+                new_vals = torch.randn_like(param.data) * std
             elif weight == 'W_in':
-                self.W_in.data = torch.randn(self.hidden_size, self.input_size) * std
+                param = self.W_in
+                new_vals = torch.randn_like(param.data) * std
             elif weight == 'W_out':
-                self.W_out.data = torch.randn(self.output_size, self.hidden_size) * std
+                param = self.W_out
+                new_vals = torch.randn_like(param.data) * std
             elif weight == 'b_rec' and self.use_bias:
-                self.b_rec.data = torch.zeros(self.hidden_size)
+                param = self.b_rec
+                new_vals = torch.zeros_like(param.data)
             elif weight == 'b_out' and self.use_bias:
-                self.b_out.data = torch.zeros(self.output_size)
+                param = self.b_out
+                new_vals = torch.zeros_like(param.data)
             elif weight in ['b_rec', 'b_out'] and not self.use_bias:
                 print(f"Warning: Cannot reinitialize {weight} when use_bias=False")
+                continue
             else:
                 raise ValueError(f"Unknown weight: {weight}")
+            
+            # Element-wise mask: each entry is reinitialized independently with probability prob
+            mask = (torch.rand_like(param.data) < prob).float()
+            param.data = (1.0 - mask) * param.data + mask * new_vals
             
     def get_hidden_states(self, U):
         """
